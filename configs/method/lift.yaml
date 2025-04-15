@@ -1,0 +1,8 @@
+classifier: "CosineClassifier"
+v:
+  adaptformer: True
+
+num_epochs: 10
+lr: 0.01
+
+mda: False

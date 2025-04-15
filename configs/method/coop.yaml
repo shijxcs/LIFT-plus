@@ -1,0 +1,7 @@
+coop: True
+
+num_epochs: 50
+batch_size: 32
+lr: 0.002
+
+mda: False

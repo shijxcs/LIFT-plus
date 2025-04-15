@@ -1,0 +1,3 @@
+classifier: "CosineClassifier"
+v:
+  fft: True
