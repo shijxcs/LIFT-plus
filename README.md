@@ -16,7 +16,7 @@ pip install openai-clip timm
 
 Most experiments can be reproduced using a single GPU with 24GB of memory.
 
-- To further reduce the GPU memory cost, gradient accumulation is recommended. Please refer to the [Detailed Usage](#Detailed Usage) for instructions.
+- To further reduce the GPU memory cost, gradient accumulation is recommended. Please refer to the [Detailed Usage](#detailed-usage) for instructions.
 
 ## Quick Start on the CIFAR-100-LT dataset
 
