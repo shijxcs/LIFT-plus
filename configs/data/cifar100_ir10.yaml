@@ -1,2 +1,2 @@
 dataset: "CIFAR100_IR10" 
-root: "/home/shijx/datasets/cifar"
+root: "./data"
