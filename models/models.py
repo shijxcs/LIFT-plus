@@ -1,6 +1,7 @@
 import math
 from typing import Optional, Union
 from collections import OrderedDict
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -35,53 +36,218 @@ def convert_layernorm(ln: nn.LayerNorm) -> NonHalfLayerNorm:
     return nonhalf_ln
 
 
+def generate_mask(input, ratio, seed=None):
+    generator = torch.Generator().manual_seed(seed)  # fix the generator
+    num_params = input.numel()
+    num_masked = int(num_params * ratio)
+    masked_indexs = torch.randperm(num_params, generator=generator, dtype=torch.int64)[:num_masked]
+    mask = torch.zeros(num_params, dtype=bool).scatter_(dim=0, index=masked_indexs, value=True).view(input.shape)
+    return mask.to(input.device)
+
+
+class PEFT_Attention(nn.Module):
+    def __init__(self, in_proj: nn.Linear, out_proj: nn.Linear, num_heads: int, is_causal: bool = False):
+        super().__init__()
+        self.in_proj = in_proj
+        self.out_proj = out_proj
+        self.num_heads = num_heads
+        self.is_causal = is_causal
+    
+        self.tuner = nn.ParameterDict()
+
+    @property
+    def embed_dim(self):
+        return self.in_proj.weight.shape[1]
+
+    @property
+    def head_dim(self):
+        return self.embed_dim // self.num_heads
+    
+    @property
+    def dtype(self):
+        return self.in_proj.weight.dtype
+
+    @property
+    def device(self):
+        return self.in_proj.weight.device
+    
+    def add_lora(self, bottle_dim):
+        self.tuner["lora"] = nn.ModuleDict({
+            "q": LoRA(self.embed_dim, bottle_dim, dtype=self.dtype, device=self.device),
+            "v": LoRA(self.embed_dim, bottle_dim, dtype=self.dtype, device=self.device),
+        })  # to be optimized
+    
+    def add_ssf(self):
+        self.tuner["ssf"] = nn.ParameterDict({
+            "in_proj": SSF(self.in_proj.weight.shape[0], dtype=self.dtype, device=self.device),
+            "out_proj": SSF(self.out_proj.weight.shape[0], dtype=self.dtype, device=self.device),
+        })  # to be optimized
+
+    def add_aft(self, ratio, seed=None):
+        _generate_mask = partial(generate_mask, ratio=ratio, seed=seed)
+
+        self.tuner["aft"] = nn.ParameterDict({
+            "in_proj": MaskedLinear(self.in_proj.weight, self.in_proj.bias, _generate_mask(self.in_proj.weight), _generate_mask(self.in_proj.bias)),
+            "out_proj": MaskedLinear(self.out_proj.weight, self.out_proj.bias, _generate_mask(self.out_proj.weight), _generate_mask(self.out_proj.bias)),
+        })  # to be optimized
+
+    def forward(self, x: torch.Tensor):
+        L, N, D = x.shape
+        
+        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "in_proj"):
+            qkv = self.tuner.aft.in_proj(x)
+        else:
+            qkv = self.in_proj(x)
+        
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        if hasattr(self.tuner, "lora") and hasattr(self.tuner.lora, "q"):
+            q = q + self.tuner.lora.q(x)
+        if hasattr(self.tuner, "lora") and hasattr(self.tuner.lora, "k"):
+            k = k + self.tuner.lora.k(x)
+        if hasattr(self.tuner, "lora") and hasattr(self.tuner.lora, "v"):
+            v = v + self.tuner.lora.v(x)
+        
+        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "in_proj"):
+            qkv = torch.cat([q, k, v], dim=-1)
+            qkv = self.tuner.ssf.in_proj(qkv)
+            q, k, v = qkv.chunk(3, dim=-1)
+        
+        q = q.reshape(L, N * self.num_heads, self.head_dim).transpose(0, 1)
+        k = k.reshape(L, N * self.num_heads, self.head_dim).transpose(0, 1)
+        v = v.reshape(L, N * self.num_heads, self.head_dim).transpose(0, 1)
+        x = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
+        x = x.transpose(0, 1).reshape(L, N, D)
+
+        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "out_proj"):
+            x = self.tuner.aft.out_proj(x)
+        else:
+            x = self.out_proj(x)
+        
+        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "out_proj"):
+            x = self.tuner.ssf.out_proj(x)
+        
+        return x
+
+
+class PEFT_MLP(nn.Module):
+    def __init__(self, in_proj: nn.Linear, act_layer: nn.Module, out_proj: nn.Linear):
+        super().__init__()
+        self.in_proj = in_proj
+        self.act_layer = act_layer
+        self.out_proj = out_proj
+    
+        self.tuner = nn.ParameterDict()
+
+    @property
+    def embed_dim(self):
+        return self.in_proj.weight.shape[1]
+
+    @property
+    def dtype(self):
+        return self.in_proj.weight.dtype
+
+    @property
+    def device(self):
+        return self.in_proj.weight.device
+
+    def add_adapter(self, bottle_dim):
+        self.tuner["adapter"] = Adapter(self.embed_dim, bottle_dim, dtype=self.dtype, device=self.device)  # to be optimized
+
+    def add_ssf(self):
+        self.tuner["ssf"] = nn.ParameterDict({
+            "in_proj": SSF(self.in_proj.weight.shape[0], dtype=self.dtype, device=self.device),
+            "out_proj": SSF(self.out_proj.weight.shape[0], dtype=self.dtype, device=self.device),
+        })  # to be optimized
+
+    def add_aft(self, ratio, seed=None):
+        _generate_mask = partial(generate_mask, ratio=ratio, seed=seed)
+
+        self.tuner["aft"] = nn.ParameterDict({
+            "in_proj": MaskedLinear(self.in_proj.weight, self.in_proj.bias, _generate_mask(self.in_proj.weight), _generate_mask(self.in_proj.bias)),
+            "out_proj": MaskedLinear(self.out_proj.weight, self.out_proj.bias, _generate_mask(self.out_proj.weight), _generate_mask(self.out_proj.bias)),
+        })  # to be optimized
+
+    def forward(self, x: torch.Tensor):
+        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "in_proj"):
+            x = self.tuner.aft.in_proj(x)
+        else:
+            x = self.in_proj(x)
+        
+        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "in_proj"):
+            x = self.tuner.ssf.in_proj(x)
+
+        x = self.act_layer(x)
+
+        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "out_proj"):
+            x = self.tuner.aft.out_proj(x)
+        else:
+            x = self.out_proj(x)
+
+        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "out_proj"):
+            x = self.tuner.ssf.out_proj(x)
+        
+        if hasattr(self.tuner, "adapter"):
+            x = x + self.tuner.adapter(x)
+        
+        return x
+
+
 class PEFT_Block(nn.Module):
     def __init__(self, block: Union[CLIP_Block, TIMM_Block], is_causal=False, norm_first=True):
         super().__init__()
 
         if isinstance(block, CLIP_Block):
             self.norm1 = convert_layernorm(block.ln_1)
-            self.attn_in = create_linear(block.attn.in_proj_weight, block.attn.in_proj_bias)
-            self.attn_out = block.attn.out_proj
+            self.attn = PEFT_Attention(
+                in_proj=create_linear(block.attn.in_proj_weight, block.attn.in_proj_bias),
+                out_proj=block.attn.out_proj,
+                num_heads=block.attn.num_heads,
+                is_causal=is_causal,
+            )
             self.norm2 = convert_layernorm(block.ln_2)
-            self.mlp_in = block.mlp[0]
-            self.mlp_act = block.mlp[1]
-            self.mlp_out = block.mlp[2]
-            self.num_heads = block.attn.num_heads
+            self.mlp = PEFT_MLP(
+                in_proj=block.mlp[0],
+                act_layer=block.mlp[1],
+                out_proj=block.mlp[2],
+            )
 
         elif isinstance(block, TIMM_Block):
             self.norm1 = convert_layernorm(block.norm1)
-            self.attn_in = block.attn.qkv
-            self.attn_out = block.attn.proj
+            self.attn = PEFT_Attention(
+                in_proj=block.attn.qkv,
+                out_proj=block.attn.proj,
+                num_heads=block.attn.num_heads,
+                is_causal=is_causal,
+            )
             self.norm2 = convert_layernorm(block.norm2)
-            self.mlp_in = block.mlp.fc1
-            self.mlp_act = block.mlp.act
-            self.mlp_out = block.mlp.fc2
-            self.num_heads = block.attn.num_heads
+            self.mlp = PEFT_MLP(
+                in_proj=block.mlp.fc1,
+                act_layer=block.mlp.act,
+                out_proj=block.mlp.fc2,
+            )
 
         else:
             raise TypeError
 
-        self.is_causal = is_causal
         self.norm_first = norm_first
 
-        self.tuner = nn.ParameterDict()
+        self.tuner = nn.ParameterDict({
+            "attn": self.attn.tuner,
+            "mlp": self.mlp.tuner,
+        })
     
     @property
     def embed_dim(self):
-        return self.attn_in.weight.shape[1]
-
-    @property
-    def head_dim(self):
-        return self.embed_dim // self.num_heads
+        return self.attn.embed_dim
 
     @property
     def dtype(self):
-        return self.attn_in.weight.dtype
+        return self.attn.dtype
 
     @property
     def device(self):
-        return self.attn_in.weight.device
+        return self.attn.device
     
     def unfreeze_params(self):
         for name, param in self.named_parameters():
@@ -99,53 +265,33 @@ class PEFT_Block(nn.Module):
         self.tuner["prompt"] = prompt  # to be optimized
 
     def add_lora(self, bottle_dim):
-        self.tuner["lora"] = nn.ModuleDict({
-            "q": LoRA(self.embed_dim, bottle_dim, dtype=self.dtype, device=self.device),
-            "v": LoRA(self.embed_dim, bottle_dim, dtype=self.dtype, device=self.device),
-        })  # to be optimized
+        self.attn.add_lora(bottle_dim)
 
     def add_adapter(self, bottle_dim):
-        self.tuner["adapter"] = Adapter(self.embed_dim, bottle_dim, dtype=self.dtype, device=self.device)  # to be optimized
+        self.mlp.add_adapter(bottle_dim)
     
     def add_adaptformer(self, bottle_dim):
         self.tuner["adaptformer"] = AdaptFormer(self.embed_dim, bottle_dim, dtype=self.dtype, device=self.device)  # to be optimized
 
     def add_ssf(self):
-        self.tuner["ssf"] = nn.ParameterDict()
-        self.tuner["ssf"]["attn_in"] = SSF(self.attn_in.weight.shape[0], dtype=self.dtype, device=self.device)  # to be optimized
-        self.tuner["ssf"]["attn_out"] = SSF(self.attn_out.weight.shape[0], dtype=self.dtype, device=self.device)  # to be optimized
-        self.tuner["ssf"]["mlp_in"] = SSF(self.mlp_in.weight.shape[0], dtype=self.dtype, device=self.device)  # to be optimized
-        self.tuner["ssf"]["mlp_out"] = SSF(self.mlp_out.weight.shape[0], dtype=self.dtype, device=self.device)  # to be optimized
+        self.attn.add_ssf()
+        self.mlp.add_ssf()
 
     def add_aft(self, ratio, loc="mlp", seed=None):
-        generator = torch.Generator().manual_seed(seed)  # fix the generator
-        def _generate_mask(input):
-            num_params = input.numel()
-            num_masked = int(num_params * ratio)
-            masked_indexs = torch.randperm(num_params, generator=generator, dtype=torch.int64)[:num_masked]
-            mask = torch.zeros(num_params, dtype=bool).scatter_(dim=0, index=masked_indexs, value=True).view(input.shape)
-            return mask.to(self.device)
-
-        self.tuner["aft"] = nn.ParameterDict()
         if loc in ("attn", "all"):
-            self.tuner["aft"]["attn_in"] = MaskedLinear(self.attn_in.weight, self.attn_in.bias, _generate_mask(self.attn_in.weight), _generate_mask(self.attn_in.bias))  # to be optimized
-            self.tuner["aft"]["attn_out"] = MaskedLinear(self.attn_out.weight, self.attn_out.bias, _generate_mask(self.attn_out.weight), _generate_mask(self.attn_out.bias))  # to be optimized
+            self.attn.add_aft(ratio, seed)
         if loc in ("mlp", "all"):
-            self.tuner["aft"]["mlp_in"] = MaskedLinear(self.mlp_in.weight, self.mlp_in.bias, _generate_mask(self.mlp_in.weight), _generate_mask(self.mlp_in.bias))  # to be optimized
-            self.tuner["aft"]["mlp_out"] = MaskedLinear(self.mlp_out.weight, self.mlp_out.bias, _generate_mask(self.mlp_out.weight), _generate_mask(self.mlp_out.bias))  # to be optimized
-
+            self.mlp.add_aft(ratio, seed)
+        
     def forward(self, x):
-        _batch_size = x.shape[1]
-        _embed_dim = x.shape[2]
+        L, N, D = x.shape
 
         if hasattr(self.tuner, "prompt"):
             raw_seq_len = self.raw_input_shape[0]
             prefix = x[:1, :, :]
             suffix = x[-(raw_seq_len-1):, :, :]
-            prompt = self.tuner.prompt.unsqueeze(1).expand(-1, _batch_size, -1)
+            prompt = self.tuner.prompt.unsqueeze(1).expand(-1, N, -1)
             x = torch.cat([prefix, prompt, suffix], dim=0)
-
-        _seq_len_now = x.shape[0]
 
         ###############################
         ## Multi-Head Self-Attention ##
@@ -155,44 +301,7 @@ class PEFT_Block(nn.Module):
         if self.norm_first:
             x = self.norm1(x)
 
-        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "attn_in"):
-            qkv = self.tuner.aft.attn_in(x)
-        else:
-            qkv = self.attn_in(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        if hasattr(self.tuner, "lora"):
-            q = q + self.tuner.lora.q(x)
-            v = v + self.tuner.lora.v(x)
-        
-        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "attn_in"):
-            qkv = torch.cat([q, k, v], dim=-1)
-            qkv = self.tuner.ssf.attn_in(qkv)
-            q, k, v = qkv.chunk(3, dim=-1)
-
-        q = q.contiguous().view(q.shape[0], q.shape[1] * self.num_heads, self.head_dim).transpose(0, 1)  # [bsz * num_heads, seq_len, head_dim]
-        k = k.contiguous().view(k.shape[0], k.shape[1] * self.num_heads, self.head_dim).transpose(0, 1)  # [bsz * num_heads, seq_len, head_dim]
-        v = v.contiguous().view(v.shape[0], v.shape[1] * self.num_heads, self.head_dim).transpose(0, 1)  # [bsz * num_heads, seq_len, head_dim]
-
-        x = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
-        # scaled_dot_product_attention:
-        # attn = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
-        # if self.is_causal:
-        #     attn += torch.empty(_seq_len_now, _seq_len_now, dtype=self.dtype, device=self.device).fill_(float("-inf")).triu_(1)
-        # attn = F.softmax(attn, dim=-1)
-        # x = attn @ v
-
-        x = x.transpose(0, 1).contiguous().view(-1, _embed_dim)  # [seq_len * bsz * num_heads, head_dim]
-        
-        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "attn_out"):
-            x = self.tuner.aft.attn_out(x)
-        else:
-            x = self.attn_out(x)
-        
-        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "attn_out"):
-            x = self.tuner.ssf.attn_out(x)
-
-        x = x.view(_seq_len_now, _batch_size, _embed_dim)
+        x = self.attn(x)
         
         x = identity + x
 
@@ -207,26 +316,7 @@ class PEFT_Block(nn.Module):
         if self.norm_first:
             x = self.norm2(x)
         
-        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "mlp_in"):
-            x = self.tuner.aft.mlp_in(x)
-        else:
-            x = self.mlp_in(x)
-        
-        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "mlp_in"):
-            x = self.tuner.ssf.mlp_in(x)
-
-        x = self.mlp_act(x)
-
-        if hasattr(self.tuner, "aft") and hasattr(self.tuner.aft, "mlp_out"):
-            x = self.tuner.aft.mlp_out(x)
-        else:
-            x = self.mlp_out(x)
-
-        if hasattr(self.tuner, "ssf") and hasattr(self.tuner.ssf, "mlp_out"):
-            x = self.tuner.ssf.mlp_out(x)
-        
-        if hasattr(self.tuner, "adapter"):
-            x = x + self.tuner.adapter(x)
+        x = self.mlp(x)
         
         if hasattr(self.tuner, "adaptformer"):
             x = x + self.tuner.adaptformer(identity)
